@@ -17,6 +17,8 @@ macro_rules! syscall {
 }
 
 
+const LISTENER_KEY: u64 = 100;
+const EVENT_BUFFER_SIZE: usize = 1024;
 const READ_BUFFER_SIZE: usize = 1024;
 const WRITE_BUFFER_SIZE: usize = 1024;
 const READ_FLAGS: i32 = libc::EPOLLONESHOT | libc::EPOLLIN;
@@ -58,17 +60,14 @@ impl Connection {
         flags
     }
 
-    fn read(&mut self) -> io::Result<()> {
+    fn read(&mut self) -> io::Result<usize> {
         // Read data from the connection
         match self.stream.read(&mut self.read_buf[self.read_len..]) {
             Ok(0) => {
-                // EOF
-                println!("Connection closed by peer");
-                Err(io::ErrorKind::UnexpectedEof.into())
+                Ok(0)
             },
             Ok(n) => {
-                println!("Read {} bytes", n);
-                Ok(())
+                Ok(n)
             },
             Err(err) => {
                 Err(err)
@@ -76,18 +75,15 @@ impl Connection {
         }
     }
 
-    fn write(&mut self) -> io::Result<()> {
+    fn write(&mut self) -> io::Result<usize> {
         // Write data to the connection
         match self.stream.write(&self.write_buf[..self.write_len]) {
             Ok(0) => {
-                // EOF
-                println!("Connection closed by peer");
-                Err(io::ErrorKind::UnexpectedEof.into())
+                Ok(0)
             },
             Ok(n) => {
                 self.write_len -= n;
-                println!("Wrote {} bytes", n);
-                Ok(())
+                Ok(n)
             },
             Err(err) => {
                 Err(err)
@@ -97,8 +93,135 @@ impl Connection {
 }
 
 
+fn connection_accept(
+    listener: &TcpListener,
+    epoll_fd: RawFd,
+    key: &mut u64,
+    connections: &mut HashMap<u64, Connection>,
+) -> io::Result<()> {
+    match listener.accept() {
+        Ok((stream, _)) => {
+            // Set the stream to non-blocking mode
+            stream.set_nonblocking(true)?;
+
+            // Get the file descriptor for the stream
+            let stream_fd = stream.as_raw_fd();
+
+            // Increment the key
+            *key += 1;
+
+            // Register interest in stream read events
+            epoll_ctl_add(epoll_fd, stream_fd, *key, READ_FLAGS)?;
+
+            // Add the connection to the connections map
+            connections.insert(*key, Connection::new(*key, stream));
+        },
+        Err(err) => {
+            if err.kind() != io::ErrorKind::WouldBlock {
+                return Err(err);
+            }
+        }
+    }
+
+    // Re-register interest in listener read events
+    epoll_ctl_mod(epoll_fd, listener.as_raw_fd(), LISTENER_KEY, READ_FLAGS)?;
+
+    Ok(())
+}
+
+
+fn connection_read_write(
+    key: u64,
+    events: u32,
+    epoll_fd: RawFd,
+    connections: &mut HashMap<u64, Connection>,
+) -> io::Result<()> {
+    if let Some(conn) = connections.get_mut(&key) {
+        if events & libc::EPOLLIN as u32 != 0 {
+            // Read data from the connection
+            match conn.read() {
+                Ok(0) => {
+                    // EOF
+                    let conn_key = conn.key;
+                    connections.remove(&conn_key);
+                    println!("Connection closed by peer");
+                },
+                Ok(n) => {
+                    // Re-register interest in events
+                    println!("Read {} bytes", n);
+                    epoll_ctl_mod(
+                        epoll_fd,
+                        conn.stream.as_raw_fd(),
+                        conn.key,
+                        conn.epoll_flags(),
+                    )?;
+                },
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        // Re-register interest in events
+                        epoll_ctl_mod(
+                            epoll_fd,
+                            conn.stream.as_raw_fd(),
+                            conn.key,
+                            conn.epoll_flags(),
+                        )?;
+                    } else {
+                        let conn_key = conn.key;
+                        connections.remove(&conn_key);
+                        println!(
+                            "Error reading from connection: {}",
+                            err,
+                        );
+                    }
+                }
+            }
+        } else if events & libc::EPOLLOUT as u32 != 0 {
+            // Write data to the connection
+            match conn.write() {
+                Ok(0) => {
+                    // Connection closed by peer
+                    let conn_key = conn.key;
+                    connections.remove(&conn_key);
+                    println!("Connection closed by peer");
+                },
+                Ok(n) => {
+                    // Re-register interest in events
+                    println!("Wrote {} bytes", n);
+                    epoll_ctl_mod(
+                        epoll_fd,
+                        conn.stream.as_raw_fd(),
+                        conn.key,
+                        conn.epoll_flags(),
+                    )?;
+                },
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        // Re-register interest in events
+                        epoll_ctl_mod(
+                            epoll_fd,
+                            conn.stream.as_raw_fd(),
+                            conn.key,
+                            conn.epoll_flags(),
+                        )?;
+                    } else {
+                        let conn_key = conn.key;
+                        connections.remove(&conn_key);
+                        println!(
+                            "Error writing to connection: {}",
+                            err,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
 fn epoll_create() -> io::Result<RawFd> {
-    let fd = syscall!(epoll_create1(0))?;
+    let fd = syscall!(epoll_create1(libc::EPOLL_CLOEXEC))?;
     Ok(fd)
 }
 
@@ -117,10 +240,10 @@ fn epoll_ctl_mod(epoll_fd: RawFd, fd: RawFd, key: u64, flags: i32) -> io::Result
 }
 
 
-fn main() -> io::Result<()> {
+fn event_loop(addr: &str) -> io::Result<()> {
     // Create TCP listener
-    println!("Starting TCP listener on 127.0.0.1:9001");
-    let listener = TcpListener::bind("127.0.0.1:9001")?;
+    println!("Starting TCP listener on {}", addr);
+    let listener = TcpListener::bind(addr)?;
     listener.set_nonblocking(true)?;
 
     // Get the file descriptor for the listener
@@ -132,11 +255,11 @@ fn main() -> io::Result<()> {
 
     // Register interest in listener incoming connections
     println!("Registering interest in incoming connections");
-    let mut key = 100;  // key used to identify the fd associated with the event
-    epoll_ctl_add(epoll_fd, listener_fd, key, READ_FLAGS)?;
+    let mut key = LISTENER_KEY;  // key used to identify the fd associated with the event
+    epoll_ctl_add(epoll_fd, listener_fd, LISTENER_KEY, READ_FLAGS)?;
     
     // Create vector to store incoming epoll events
-    let mut events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
+    let mut events: Vec<libc::epoll_event> = Vec::with_capacity(EVENT_BUFFER_SIZE);
 
     let mut connections: HashMap<u64, Connection> = HashMap::new();
 
@@ -169,102 +292,20 @@ fn main() -> io::Result<()> {
         // Process epoll events
         for evt in &events {
             let evt_key = evt.u64;
-            println!("Event: {}", evt_key);
-            match evt.u64 {
-                100 => {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            stream.set_nonblocking(true)?;
-
-                            println!("Accepted connection from {}", addr);
-
-                            // Increment key
-                            key += 1;
-
-                            // Register interest in read events
-                            let stream_fd = stream.as_raw_fd();
-                            epoll_ctl_add(epoll_fd, stream_fd, key, READ_FLAGS)?;
-
-                            // Store connection
-                            connections.insert(key, Connection::new(key, stream));
-                        },
-                        Err(err) => {
-                            println!("Error accepting connection: {}", err);
-                        }
-                    }
-
-                    // Re-register interest in listener incoming connections
-                    epoll_ctl_mod(epoll_fd, listener_fd, 100, READ_FLAGS)?;
+            match evt_key {
+                k if k == LISTENER_KEY => {
+                    connection_accept(&listener, epoll_fd, &mut key, &mut connections)?;
                 },
-                // Handle other events
                 key => {
-                    if let Some(conn) = connections.get_mut(&key) {
-                        if evt.events & libc::EPOLLIN as u32 != 0 {
-                            // Read data from the connection
-                            match conn.read() {
-                                Ok(()) => {
-                                    // Re-register interest in read events
-                                    epoll_ctl_mod(
-                                        epoll_fd,
-                                        conn.stream.as_raw_fd(),
-                                        conn.key,
-                                        conn.epoll_flags(),
-                                    )?;
-                                },
-                                Err(err) => {
-                                    if err.kind() == io::ErrorKind::WouldBlock {
-                                        // Re-register interest in read events
-                                        epoll_ctl_mod(
-                                            epoll_fd,
-                                            conn.stream.as_raw_fd(),
-                                            conn.key,
-                                            conn.epoll_flags(),
-                                        )?;
-                                    } else {
-                                        let conn_key = conn.key;
-                                        connections.remove(&conn_key);
-                                        println!(
-                                            "Error reading from connection: {}",
-                                            err,
-                                        );
-                                    }
-                                }
-                            }
-                        } else if evt.events & libc::EPOLLOUT as u32 != 0 {
-                            // Write data to the connection
-                            match conn.write() {
-                                Ok(()) => {
-                                    // Re-register interest in write events
-                                    epoll_ctl_mod(
-                                        epoll_fd,
-                                        conn.stream.as_raw_fd(),
-                                        conn.key,
-                                        conn.epoll_flags(),
-                                    )?;
-                                },
-                                Err(err) => {
-                                    if err.kind() == io::ErrorKind::WouldBlock {
-                                        // Re-register interest in write events
-                                        epoll_ctl_mod(
-                                            epoll_fd,
-                                            conn.stream.as_raw_fd(),
-                                            conn.key,
-                                            conn.epoll_flags(),
-                                        )?;
-                                    } else {
-                                        let conn_key = conn.key;
-                                        connections.remove(&conn_key);
-                                        println!(
-                                            "Error writing to connection: {}",
-                                            err,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    connection_read_write(key, evt.events, epoll_fd, &mut connections)?;
                 },
             }
         }
     }
+}
+
+
+fn main() {
+    let addr = "127.0.0.1:9001";
+    event_loop(addr).unwrap();
 }
